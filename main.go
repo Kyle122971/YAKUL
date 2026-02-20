@@ -15,7 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-// YOUR MASTER KEYS & INFRASTRUCTURE (RESTORED & LOCKED)
+// YOUR MASTER KEYS & INFRASTRUCTURE (LOCKED)
 const (
 	CDP_KEY_ID     = "13421f57-691e-439d-8b87-dc976ea5042a"
 	CDP_SECRET     = "eOiSYPC0ROZcYGy/4dQXsN9eNMcfNc6Kk9aytYT3LYlbrAYvdO5FtokhB0qptWuOY8y5RzLqinN3gjst0ZIzlQ=="
@@ -36,32 +36,38 @@ func main() {
 	log.SetOutput(os.Stdout)
 	
 	app := fiber.New(fiber.Config{
-		Prefork:       true,
-		ServerHeader:  "Lattice-Predator-v3",
+		Prefork:       true, // Critical for 1450 TPS
+		ServerHeader:  "Lattice-Predator-v4",
 		CaseSensitive: true,
 	})
 
-	// --- 1. THE AGGRESSOR (WITH SMART BACKOFF) ---
-	go startWideWebAggressor()
-	
-	// --- 2. THE JANITORS ---
-	go startCacheJanitor()
+	// --- THE FIX: PREVENT FORK-BOMBING ---
+	// Only the Master process runs the background scanner/janitor.
+	// Children only handle the high-speed HTTP traffic.
+	if !fiber.IsChild() {
+		log.Println("👑 [MASTER] Starting Background Aggressor and Janitors...")
+		go startWideWebAggressor()
+		go startCacheJanitor()
+	} else {
+		log.Printf("👷 [CHILD] Worker PID %d Online", os.Getpid())
+	}
 
-	// --- 3. THE REVENUE INTERFACE ---
+	// --- REVENUE ENDPOINTS (ALL PROCESSES) ---
 	app.Get("/.well-known/agent.json", handleManifest)
 	app.Get("/alert", handleLatticeExecution)
 	app.Get("/verify/:id", handleVerification)
 	
-	// Revenue Dashboard
+	// Live Status Dashboard
 	app.Get("/stats", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"total_solves": successCount.Load(),
+			"status":         "active",
+			"total_solves":   successCount.Load(),
 			"gold_list_size": getMapLen(&goldList),
-			"uptime": time.Now().Format(time.RFC822),
+			"worker_pid":     os.Getpid(),
 		})
 	})
 
-	log.Printf("🔥 [PREDATOR] Engine Armed | 1450 TPS Target | Smart Backoff Active")
+	log.Printf("🔥 [PREDATOR] Engine Armed | Port: 4021 | PID: %d", os.Getpid())
 	log.Fatal(app.Listen(":4021"))
 }
 
@@ -94,26 +100,27 @@ func handleLatticeExecution(c *fiber.Ctx) error {
 	solveCache.Store(solveID, time.Now())
 	successCount.Add(1)
 
-	return c.JSON(fiber.Map{"status": "settled", "solve": solveID, "ops": successCount.Load()})
+	return c.JSON(fiber.Map{"status": "settled", "solve": solveID})
 }
 
-// --- WIDE-WEB MULTI-PORT POKE WITH SMART BACKOFF ---
+// --- WIDE-WEB SCANNER WITH SMART BACKOFF ---
 
 func startWideWebAggressor() {
 	client := &http.Client{Timeout: 800 * time.Millisecond}
 	businessPorts := []string{"80", "443", "4021", "8080", "5000"}
 
 	for {
-		for i := 0; i < 300; i++ {
+		// Burst generation
+		for i := 0; i < 200; i++ {
 			targetIP := fmt.Sprintf("%d.%d.%d.%d", rand.Intn(223)+1, rand.Intn(255), rand.Intn(255), rand.Intn(255))
 			
 			for _, port := range businessPorts {
 				targetURL := fmt.Sprintf("%s:%s", targetIP, port)
 
-				// SMART BACKOFF: Only poke if we haven't seen them, or if 24 hours have passed
+				// Check Backoff
 				if lastPoke, seen := goldList.Load(targetURL); seen {
 					if time.Since(lastPoke.(time.Time)) < BackoffWindow {
-						continue // Skip: Business courtesy / Anti-ban
+						continue 
 					}
 				}
 
@@ -125,7 +132,7 @@ func startWideWebAggressor() {
 					resp, err := client.Do(req)
 					if err == nil {
 						if resp.StatusCode == 200 {
-							log.Printf("🎯 [GOLD LIST] New Lead: %s", url)
+							log.Printf("🎯 [GOLD LIST] Verified Agent: %s", url)
 							goldList.Store(url, time.Now())
 						}
 						resp.Body.Close()
@@ -133,19 +140,20 @@ func startWideWebAggressor() {
 				}(targetURL, port)
 			}
 		}
-		time.Sleep(400 * time.Millisecond)
+		// Slight delay to keep the Master process CPU stable
+		time.Sleep(1 * time.Second)
 	}
 }
 
-// --- SUPPORTING LOGIC ---
+// --- UTILS ---
 
 func getMapLen(m *sync.Map) int {
-	len := 0
+	length := 0
 	m.Range(func(k, v any) bool {
-		len++
+		length++
 		return true
 	})
-	return len
+	return length
 }
 
 func handleManifest(c *fiber.Ctx) error {
@@ -171,13 +179,6 @@ func startCacheJanitor() {
 		solveCache.Range(func(k, v any) bool {
 			if time.Since(v.(time.Time)) > 2*time.Hour {
 				solveCache.Delete(k)
-			}
-			return true
-		})
-		// Prune Gold List only after 48 hours to keep the backoff history relevant
-		goldList.Range(func(k, v any) bool {
-			if time.Since(v.(time.Time)) > 48*time.Hour {
-				goldList.Delete(k)
 			}
 			return true
 		})
