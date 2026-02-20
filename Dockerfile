@@ -1,18 +1,19 @@
-FROM golang:1.21-alpine
-
-# 1. Install system dependencies
-RUN apk add --no-cache git ca-certificates
-
+FROM golang:1.21-alpine AS builder
 WORKDIR /app
-
-# 2. Force-initialize the module and dependencies inside the container
-COPY . .
-RUN go mod tidy
+COPY go.mod ./
 RUN go mod download
+COPY . .
+# Static build
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o engine .
 
-# 3. Build with static linking (Standard for Northflank)
-RUN CGO_ENABLED=0 GOOS=linux go build -o /lattice_engine .
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/engine .
 
-# 4. Final settings
+# THE OOM FIX: Tell Go to be aggressive with memory
+ENV GOGC=50 
+ENV GOMEMLIMIT=7GiB
+
 EXPOSE 4021
-CMD ["/lattice_engine"]
+CMD ["./engine"]
