@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: service
+metadata:
+  name: lattice-predator
+spec:
+  runtime: docker
+  port: 4021
+  resources:
+    plan: "4 vCPU / 8 GB"
+  env:
+    - key: PORT
+      value: "4021"
